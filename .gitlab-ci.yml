@@ -1,0 +1,68 @@
+stages:
+  - build
+  - test
+  - dockerize
+  - deploy
+
+variables:
+  DOCKER_IMAGE: registry.example.com/your-username/rust-app:$CI_COMMIT_SHORT_SHA
+
+# 缓存 Cargo 依赖以加速构建
+cache:
+  key: $CI_COMMIT_REF_SLUG #定义缓存的唯一标识符，确保不同分支（branch）或标签（tag）使用独立的缓存。
+  paths:
+    - target/
+    - .cargo/
+
+# 阶段 1: 构建 Rust 项目
+build:
+  stage: build
+  image: rust:latest
+  script:
+    - cargo build --release
+  artifacts:
+    paths:
+      - target/release/jupiter
+
+# 阶段 2: 运行测试
+test:
+  stage: test
+  image: rust:latest
+  script:
+    - cargo test --verbose
+    - cargo clippy -- -D warnings  # 静态代码检查
+
+# 阶段 3: 构建 Docker 镜像并推送到仓库
+dockerize:
+  stage: dockerize
+  image: docker:latest
+  needs: ["build", "test"]  # 依赖 build 和 test 阶段
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY" #在 GitLab 项目的 Settings > CI/CD > Variables 中预先配置
+    - docker build -t $DOCKER_IMAGE .
+    - docker push $DOCKER_IMAGE
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"  # 仅 main 分支触发
+
+# 阶段 4: 部署到服务器
+deploy:
+  stage: deploy
+  image: alpine:latest
+  needs: ["dockerize"]
+  before_script:
+    - apk add --no-cache openssh-client rsync gettext
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+  script:
+    - envsubst < docker-compose.prod.template.yml > docker-compose.prod.yml
+    - scp docker-compose.prod.yml user@your-server:/opt/your-app/
+    # 通过 SSH 连接到服务器并更新容器
+    - ssh -o StrictHostKeyChecking=no user@your-server-ip << EOF
+      docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+      docker pull $DOCKER_IMAGE
+      docker-compose -f docker-compose.prod.yml up -d --force-recreate
+      EOF
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"  # 仅 main 分支部署
